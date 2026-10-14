@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 from llama_index.core.workflow import Event
 
 from mobilerun.agent.trajectory.writer import make_serializable
-from mobilerun.macro.state import MACRO_SCHEMA_VERSION, UNSUPPORTED_SCHEMA_MESSAGE
+from mobilerun.macro.state import check_macro_schema_version
 
 logger = logging.getLogger("mobilerun")
 
@@ -143,8 +143,7 @@ class Trajectory:
             with open(macro_file_path, "r") as f:
                 macro_data = json.load(f)
 
-            if macro_data.get("macro_schema_version") != MACRO_SCHEMA_VERSION:
-                raise ValueError(UNSUPPORTED_SCHEMA_MESSAGE)
+            check_macro_schema_version(macro_data)
 
             logger.debug(
                 f"📖 Loaded macro sequence with {macro_data.get('total_actions', 0)} actions from {macro_file_path}"

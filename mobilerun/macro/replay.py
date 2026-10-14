@@ -13,13 +13,15 @@ from typing import Any, Dict, Optional
 from mobilerun_core_local.driver.android import AndroidDriver
 
 from mobilerun.agent.utils.trajectory import Trajectory
+from mobilerun.macro.anchor import resolve_anchor_with_screen
 from mobilerun.macro.handoff import run_agent_handoff
 from mobilerun.macro.matcher import StateMatchResult, compare_states
-from mobilerun.macro.state import (
-    MACRO_SCHEMA_VERSION,
-    UNSUPPORTED_SCHEMA_MESSAGE,
-    normalize_ui_state,
+from mobilerun.macro.resolutions import (
+    find_matching_cases,
+    format_case_summary,
+    record_case,
 )
+from mobilerun.macro.state import check_macro_schema_version, normalize_ui_state
 from mobilerun.tools.filters import DetailedFilter
 from mobilerun.tools.formatters import IndexedFormatter
 from mobilerun.tools.ui.provider import AndroidStateProvider
@@ -50,6 +52,7 @@ class MacroPlayer:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         config_path: Optional[str] = None,
+        resolve_mode: str = "anchors",
     ):
         """
         Initialize the MacroPlayer.
@@ -57,7 +60,13 @@ class MacroPlayer:
         Args:
             device_serial: Serial number of the target device. If None, will use first available device.
             delay_between_actions: Delay in seconds between each action (default: 1.0s)
+            resolve_mode: "anchors" re-resolves element anchors against the
+                live UI before tapping (falls back to recorded coordinates
+                only for anchor-less v2 actions); "coords" always uses the
+                recorded coordinates (legacy behavior).
         """
+        if resolve_mode not in ("anchors", "coords"):
+            raise ValueError("resolve_mode must be 'anchors' or 'coords'")
         self.device_serial = device_serial
         self.delay_between_actions = delay_between_actions
         self.on_mismatch = on_mismatch
@@ -68,7 +77,11 @@ class MacroPlayer:
         self.provider = provider
         self.model = model
         self.config_path = config_path
+        self.resolve_mode = resolve_mode
         self.last_divergence: Optional[Dict[str, Any]] = None
+        # Per-step execution ledger: [{step, action_type, mode, ...}].
+        # mode is anchor/coords/agent/skip (+ strategy / reason details).
+        self.step_results: list = []
         self.state_provider = None
         self.driver: AndroidDriver | None = None
         self.credential_manager = None
@@ -312,11 +325,131 @@ class MacroPlayer:
             logger.error(f"❌ Error executing action {action_type}: {e}")
             return False
 
+    def _resolve_action(
+        self, action: Dict[str, Any], current_state: Optional[Dict[str, Any]]
+    ) -> tuple:
+        """Resolve an anchored action against the live UI.
+
+        Returns ``(action_to_execute, info)`` where info describes how the
+        coordinates were chosen: ``{"mode": "anchor", "strategy": ...}``,
+        ``{"mode": "coords", ...}``, or
+        ``{"mode": "unresolvable", "reason": ...}`` when an anchor exists
+        but matches nothing (caller treats this as a divergence).
+        """
+        anchor = action.get("anchor")
+        if (
+            self.resolve_mode != "anchors"
+            or not anchor
+            or action.get("action_type") != "tap"
+            or not current_state
+        ):
+            return action, {"mode": "coords", "reason": "no anchor or coords mode"}
+        nodes = current_state.get("nodes") or []
+        hit = resolve_anchor_with_screen(
+            anchor,
+            nodes,
+            (action.get("pre_state") or {}).get("screen"),
+            current_state.get("screen"),
+        )
+        if hit is None:
+            return action, {"mode": "unresolvable", "reason": "anchor matched nothing"}
+        (x, y), strategy = hit
+        resolved = dict(action)
+        resolved["x"], resolved["y"] = x, y
+        logger.info(f"   🎯 Anchor resolved via {strategy}: ({x}, {y})")
+        return resolved, {"mode": "anchor", "strategy": strategy}
+
+    async def _agent_handoff_with_case(
+        self,
+        *,
+        description: str,
+        macro_data: Dict[str, Any],
+        macro_source_path: Optional[str],
+        action: Dict[str, Any],
+        step: int,
+        action_type: str,
+        divergence: Dict[str, Any],
+        current_state: Dict[str, Any],
+    ) -> bool:
+        """Hand off to the agent, enumerating + recording resolution cases."""
+        matched: list = []
+        if macro_source_path:
+            try:
+                matched = find_matching_cases(
+                    macro_source_path, current_state, diverged_step=step
+                )
+            except Exception as e:
+                logger.debug("Case lookup failed: %s", e)
+        if matched:
+            logger.warning(f"📚 Found {len(matched)} known case(s) for this state:")
+            for score, case in matched:
+                logger.warning(f"   {format_case_summary(score, case)}")
+        else:
+            logger.info("📚 No known cases for this state; recording a new one")
+
+        case_context = [format_case_summary(s, c) for s, c in matched]
+        sink: Dict[str, Any] = {}
+        try:
+            ok = await self.handoff_runner(
+                goal=description,
+                device_serial=self.device_serial,
+                provider=self.provider,
+                model=self.model,
+                config_path=self.config_path,
+                divergence=divergence,
+                current_state=current_state,
+                remaining_actions=macro_data["actions"][step - 1 :],
+                case_context=case_context,
+                result_sink=sink,
+            )
+        except TypeError:
+            # Custom handoff_runner without the extended kwargs.
+            ok = await self.handoff_runner(
+                goal=description,
+                device_serial=self.device_serial,
+                provider=self.provider,
+                model=self.model,
+                config_path=self.config_path,
+                divergence=divergence,
+                current_state=current_state or {},
+                remaining_actions=macro_data["actions"][step - 1 :],
+            )
+        self.step_results.append(
+            {
+                "step": step,
+                "action_type": action_type,
+                "mode": "agent",
+                "success": bool(ok),
+                "precedent_cases": [c.get("case_id") for _, c in matched],
+            }
+        )
+        if macro_source_path:
+            try:
+                record_case(
+                    macro_source_path,
+                    diverged_step=step,
+                    action=action,
+                    divergence=divergence,
+                    snapshot=current_state,
+                    resolution={
+                        "mode": "agent",
+                        "success": bool(ok),
+                        "summary": f"agent handoff ({'ok' if ok else 'failed'})",
+                        "agent_trajectory": sink.get("agent_trajectory"),
+                        "agent_actions": sink.get("agent_actions"),
+                        "precedent_cases": [c.get("case_id") for _, c in matched],
+                    },
+                )
+            except Exception as e:
+                logger.debug("Case recording failed: %s", e)
+        return bool(ok)
+
     async def replay_macro(
         self,
         macro_data: Dict[str, Any],
         start_from_step: int = 0,
         max_steps: Optional[int] = None,
+        macro_source_path: Optional[str] = None,
     ) -> bool:
         """
         Replay a complete macro sequence.
@@ -325,6 +458,8 @@ class MacroPlayer:
             macro_data: Macro data dictionary loaded from JSON
             start_from_step: Step number to start from (0-based, default: 0)
             max_steps: Maximum number of steps to execute (default: all)
+            macro_source_path: Macro file or trajectory folder path. Used to
+                load/enumerate divergence cases in resolutions.json.
 
         Returns:
             True if all actions were executed successfully, False otherwise
@@ -332,8 +467,7 @@ class MacroPlayer:
         if not macro_data or "actions" not in macro_data:
             logger.error("❌ Invalid macro data - no actions found")
             return False
-        if macro_data.get("macro_schema_version") != MACRO_SCHEMA_VERSION:
-            raise ValueError(UNSUPPORTED_SCHEMA_MESSAGE)
+        check_macro_schema_version(macro_data)
 
         actions = macro_data["actions"]
         description = macro_data.get("description", "Unknown macro")
@@ -374,20 +508,61 @@ class MacroPlayer:
                 }
                 if self.on_mismatch == "agent":
                     logger.warning("🤖 Handing off to agent after macro divergence")
-                    return await self.handoff_runner(
-                        goal=description,
-                        device_serial=self.device_serial,
-                        provider=self.provider,
-                        model=self.model,
-                        config_path=self.config_path,
+                    return await self._agent_handoff_with_case(
+                        description=description,
+                        macro_data=macro_data,
+                        macro_source_path=macro_source_path,
+                        action=action,
+                        step=i,
+                        action_type=action_type,
                         divergence=self.last_divergence,
                         current_state=current_state or {},
-                        remaining_actions=macro_data["actions"][i - 1 :],
+                    )
+                return False
+
+            # Anchor resolution (schema v3): re-resolve the element against
+            # the live UI; unresolvable anchors are a divergence.
+            exec_action, resolve_info = self._resolve_action(action, current_state)
+            if resolve_info["mode"] == "unresolvable":
+                self.last_divergence = {
+                    "step": i,
+                    "action_type": action_type,
+                    "reason": "anchor unresolvable: "
+                    + resolve_info.get("reason", "no match"),
+                    "score": None,
+                    "anchor": action.get("anchor"),
+                }
+                logger.warning(
+                    f"🎯 Anchor unresolvable at step {i}; "
+                    f"recorded coords kept as fallback but not trusted"
+                )
+                if self.on_mismatch == "agent":
+                    logger.warning("🤖 Handing off to agent after anchor divergence")
+                    return await self._agent_handoff_with_case(
+                        description=description,
+                        macro_data=macro_data,
+                        macro_source_path=macro_source_path,
+                        action=action,
+                        step=i,
+                        action_type=action_type,
+                        divergence=self.last_divergence,
+                        current_state=current_state or {},
                     )
                 return False
 
             # Execute the action
-            success = await self.replay_action(action, current_state=current_state)
+            success = await self.replay_action(
+                exec_action, current_state=current_state
+            )
+            self.step_results.append(
+                {
+                    "step": i,
+                    "action_type": action_type,
+                    "mode": resolve_info["mode"],
+                    "strategy": resolve_info.get("strategy"),
+                    "success": success,
+                }
+            )
 
             if success:
                 success_count += 1
@@ -415,6 +590,17 @@ class MacroPlayer:
         if failed_count > 0:
             logger.warning(f"⚠️  Failed actions: {failed_count}")
 
+        if self.step_results:
+            modes: Dict[str, int] = {}
+            for entry in self.step_results:
+                key = entry.get("mode", "?")
+                strategy = entry.get("strategy")
+                if strategy:
+                    key = f"{key}:{strategy}"
+                modes[key] = modes.get(key, 0) + 1
+            breakdown = ", ".join(f"{k}×{v}" for k, v in sorted(modes.items()))
+            logger.info(f"🧭 Step modes: {breakdown}")
+
         return failed_count == 0
 
 
@@ -430,6 +616,7 @@ async def replay_macro_file(
     on_mismatch: str = "stop",
     state_timeout: float = 5.0,
     state_threshold: float = 0.85,
+    resolve_mode: str = "anchors",
 ) -> bool:
     """
     Convenience function to replay a macro from a file.
@@ -440,6 +627,7 @@ async def replay_macro_file(
         delay_between_actions: Delay between actions in seconds
         start_from_step: Step to start from (0-based)
         max_steps: Maximum steps to execute
+        resolve_mode: "anchors" or "coords" (see MacroPlayer)
 
     Returns:
         True if replay was successful, False otherwise
@@ -450,12 +638,16 @@ async def replay_macro_file(
         on_mismatch=on_mismatch,
         state_timeout=state_timeout,
         state_threshold=state_threshold,
+        resolve_mode=resolve_mode,
     )
 
     try:
         macro_data = player.load_macro_from_file(macro_file_path)
         return await player.replay_macro(
-            macro_data, start_from_step=start_from_step, max_steps=max_steps
+            macro_data,
+            start_from_step=start_from_step,
+            max_steps=max_steps,
+            macro_source_path=macro_file_path,
         )
     except Exception as e:
         logger.error(f"❌ Error replaying macro file {macro_file_path}: {e}")
@@ -471,6 +663,7 @@ async def replay_macro_folder(
     on_mismatch: str = "stop",
     state_timeout: float = 5.0,
     state_threshold: float = 0.85,
+    resolve_mode: str = "anchors",
 ) -> bool:
     """
     Convenience function to replay a macro from a trajectory folder.
@@ -481,6 +674,7 @@ async def replay_macro_folder(
         delay_between_actions: Delay between actions in seconds
         start_from_step: Step to start from (0-based)
         max_steps: Maximum steps to execute
+        resolve_mode: "anchors" or "coords" (see MacroPlayer)
 
     Returns:
         True if replay was successful, False otherwise
@@ -491,12 +685,16 @@ async def replay_macro_folder(
         on_mismatch=on_mismatch,
         state_timeout=state_timeout,
         state_threshold=state_threshold,
+        resolve_mode=resolve_mode,
     )
 
     try:
         macro_data = player.load_macro_from_folder(trajectory_folder)
         return await player.replay_macro(
-            macro_data, start_from_step=start_from_step, max_steps=max_steps
+            macro_data,
+            start_from_step=start_from_step,
+            max_steps=max_steps,
+            macro_source_path=trajectory_folder,
         )
     except Exception as e:
         logger.error(f"❌ Error replaying macro folder {trajectory_folder}: {e}")

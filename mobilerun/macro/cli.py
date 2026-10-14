@@ -14,6 +14,7 @@ from rich.table import Table
 from mobilerun.agent.utils.trajectory import Trajectory
 from mobilerun.config_manager.path_resolver import PathResolver
 from mobilerun.macro.replay import MacroPlayer
+from mobilerun.macro.resolutions import format_case_summary, load_cases
 
 console = Console()
 
@@ -90,6 +91,14 @@ def macro_cli():
     "--provider", default=None, help="LLM provider override for agent handoff."
 )
 @click.option("--model", default=None, help="LLM model override for agent handoff.")
+@click.option(
+    "--resolve",
+    "resolve_mode",
+    type=click.Choice(["anchors", "coords"]),
+    default="anchors",
+    show_default=True,
+    help="Coordinate source for taps: re-resolve element anchors (schema v3) or use recorded coordinates.",
+)
 def replay(
     path: str,
     device: Optional[str],
@@ -104,6 +113,7 @@ def replay(
     config_path: Optional[str],
     provider: Optional[str],
     model: Optional[str],
+    resolve_mode: str,
 ):
     """Replay a macro from a file or trajectory folder."""
     logger = configure_logging(debug)
@@ -142,6 +152,7 @@ def replay(
             config_path,
             provider,
             model,
+            resolve_mode,
         )
     )
 
@@ -161,6 +172,7 @@ async def _replay_with_device(
     config_path: Optional[str],
     provider: Optional[str],
     model: Optional[str],
+    resolve_mode: str,
 ):
     device = await get_device()
     await _replay_async(
@@ -177,6 +189,7 @@ async def _replay_with_device(
         config_path,
         provider,
         model,
+        resolve_mode,
     )
 
 
@@ -194,6 +207,7 @@ async def _replay_async(
     config_path: Optional[str],
     provider: Optional[str],
     model: Optional[str],
+    resolve_mode: str,
 ):
     """Async function to handle macro replay."""
     try:
@@ -211,6 +225,7 @@ async def _replay_async(
                 config_path=config_path,
                 provider=provider,
                 model=model,
+                resolve_mode=resolve_mode,
             )
             macro_data = player.load_macro_from_file(str(resolved_path))
         elif resolved_path.is_dir():
@@ -224,6 +239,7 @@ async def _replay_async(
                 config_path=config_path,
                 provider=provider,
                 model=model,
+                resolve_mode=resolve_mode,
             )
             macro_data = player.load_macro_from_folder(str(resolved_path))
         else:
@@ -261,8 +277,12 @@ async def _replay_async(
             await _show_dry_run(macro_data, start_from, max_steps, logger)
         else:
             logger.info("▶️  Starting macro replay...")
+            logger.info(f"   Resolve mode: {resolve_mode}")
             success = await player.replay_macro(
-                macro_data, start_from_step=start_from, max_steps=max_steps
+                macro_data,
+                start_from_step=start_from,
+                max_steps=max_steps,
+                macro_source_path=str(resolved_path),
             )
 
             if success:
@@ -392,6 +412,48 @@ def list(directory: str, debug: bool):
             import traceback
 
             logger.debug(traceback.format_exc())
+
+
+@macro_cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--debug", is_flag=True, help="Enable debug logging", default=False)
+def cases(path: str, debug: bool):
+    """List recorded divergence cases (agent handoff resolutions) for a macro."""
+    logger = configure_logging(debug)
+
+    resolved_path = PathResolver.resolve(path, must_exist=True)
+    case_list = load_cases(str(resolved_path))
+    if not case_list:
+        logger.info("📭 No divergence cases recorded for this macro yet.")
+        logger.info(
+            "Cases are recorded when replay diverges with --on-mismatch agent."
+        )
+        return
+
+    logger.info(f"📚 Found {len(case_list)} divergence case(s):")
+    table = Table(title=f"Divergence Cases for {resolved_path.name}")
+    table.add_column("Case", style="cyan")
+    table.add_column("Step", style="green")
+    table.add_column("Action", style="white")
+    table.add_column("Divergence", style="yellow")
+    table.add_column("Resolution", style="magenta")
+
+    for case in case_list:
+        divergence = case.get("divergence") or {}
+        resolution = case.get("resolution") or {}
+        score = divergence.get("score")
+        table.add_row(
+            str(case.get("case_id", "?")),
+            str(case.get("diverged_step", "?")),
+            str(case.get("action_type", "?")),
+            f"{divergence.get('reason', '?')}"
+            + (f" ({score:.2f})" if isinstance(score, float) else ""),
+            f"{resolution.get('mode', '?')}"
+            f"({'ok' if resolution.get('success') else 'failed'}): "
+            f"{resolution.get('summary', '')[:60]}",
+        )
+
+    console.print(table)
 
 
 if __name__ == "__main__":

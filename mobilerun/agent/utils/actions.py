@@ -202,6 +202,37 @@ def _macro_recorder(ctx: "ActionContext"):
     return getattr(ctx, "macro_recorder", None)
 
 
+def _element_anchor(ctx: "ActionContext", index: int) -> dict | None:
+    """Build an element identity anchor for schema-v3 macros.
+
+    Returns None when the element (or its lookup) is unavailable, in
+    which case the action stays coordinate-only. Never raises: anchor
+    recording must not break action execution.
+    """
+    try:
+        from mobilerun.macro.anchor import build_anchor
+
+        ui = getattr(ctx, "ui", None)
+        get_element = getattr(ui, "get_element", None)
+        if get_element is None:
+            return None
+        return build_anchor(get_element(index))
+    except Exception:
+        return None
+
+
+def _tap_action_with_anchor(
+    ctx: "ActionContext", x: int, y: int, index: int | None
+) -> dict:
+    """Build a tap action dict, attaching an element anchor when possible."""
+    action: dict = {"action_type": "tap", "x": x, "y": y}
+    if index is not None:
+        anchor = _element_anchor(ctx, index)
+        if anchor:
+            action["anchor"] = anchor
+    return action
+
+
 def _record_macro_action(
     ctx: "ActionContext",
     action: dict,
@@ -263,7 +294,7 @@ async def click(index: int, *, ctx: "ActionContext") -> ActionResult:
         await ctx.driver.tap(x, y)
         _record_macro_action(
             ctx,
-            {"action_type": "tap", "x": x, "y": y},
+            _tap_action_with_anchor(ctx, x, y, index),
             pre_ui=pre_ui,
         )
 
@@ -404,7 +435,7 @@ async def type_text(
             await ctx.driver.tap(x, y)
             _record_macro_action(
                 ctx,
-                {"action_type": "tap", "x": x, "y": y},
+                _tap_action_with_anchor(ctx, x, y, index),
                 pre_ui=pre_ui,
             )
             pre_ui = await _macro_pre_ui_after_focus_tap(ctx)
@@ -632,7 +663,7 @@ async def type_secret(
             await ctx.driver.tap(x, y)
             _record_macro_action(
                 ctx,
-                {"action_type": "tap", "x": x, "y": y},
+                _tap_action_with_anchor(ctx, x, y, index),
                 pre_ui=pre_ui,
             )
             pre_ui = await _macro_pre_ui_after_focus_tap(ctx)

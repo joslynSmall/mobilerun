@@ -4,10 +4,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-MACRO_SCHEMA_VERSION = "2.0"
+MACRO_SCHEMA_VERSION = "3.0"
+# Schemas this codebase can read. v2 files are coordinate-only and replay
+# with the legacy path; v3 files may carry element anchors.
+SUPPORTED_MACRO_SCHEMA_VERSIONS = ("2.0", "3.0")
 UNSUPPORTED_SCHEMA_MESSAGE = (
     "Unsupported macro schema. Re-record this macro with the current Mobilerun version."
 )
+
+
+def check_macro_schema_version(macro_data: Dict[str, Any]) -> None:
+    """Raise ValueError when the macro schema cannot be read."""
+    version = macro_data.get("macro_schema_version")
+    if version not in SUPPORTED_MACRO_SCHEMA_VERSIONS:
+        raise ValueError(UNSUPPORTED_SCHEMA_MESSAGE)
 
 
 def normalize_ui_state(ui_state: Any) -> Dict[str, Any]:
@@ -17,9 +27,15 @@ def normalize_ui_state(ui_state: Any) -> Dict[str, Any]:
     screen = _extract_screen(ui_state)
 
     nodes = []
-    for element in _walk_elements(elements):
+    for path, depth, element in _walk_elements(elements):
         node = _normalize_element(element)
         if node:
+            # Structural position: index path from the tree root + depth.
+            # Used by element-anchored replay (schema v3) as a last-resort
+            # heuristic. Excluded from node_semantic_key so v2 matching
+            # scores are unchanged.
+            node["path"] = path
+            node["depth"] = depth
             nodes.append(node)
 
     return {
@@ -91,13 +107,25 @@ def _extract_screen(ui_state: Any) -> Dict[str, Any]:
     return {"width": width, "height": height}
 
 
-def _walk_elements(elements: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
-    for element in elements:
+def _walk_elements(
+    elements: Iterable[Dict[str, Any]],
+    _prefix: Tuple[int, ...] = (),
+    _depth: int = 0,
+) -> Iterable[Tuple[Tuple[int, ...], int, Dict[str, Any]]]:
+    """Yield (index-path, depth, element) triples in document order.
+
+    The index path (e.g. ``(2, 0, 3)``) records each element's position
+    among its siblings from the tree root. Flattening still discards the
+    parent links, but the path lets anchored replay fall back to a
+    positional heuristic when semantic fields are missing.
+    """
+    for i, element in enumerate(elements):
         if not isinstance(element, dict):
             continue
-        yield element
+        path = _prefix + (i,)
+        yield path, _depth, element
         children = element.get("children") or []
-        yield from _walk_elements(children)
+        yield from _walk_elements(children, path, _depth + 1)
 
 
 def _normalize_element(element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
